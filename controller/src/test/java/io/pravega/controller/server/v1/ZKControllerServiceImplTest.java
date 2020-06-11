@@ -20,6 +20,7 @@ import io.pravega.common.tracing.RequestTracker;
 import io.pravega.controller.metrics.StreamMetrics;
 import io.pravega.controller.metrics.TransactionMetrics;
 import io.pravega.controller.mocks.ControllerEventStreamWriterMock;
+import io.pravega.controller.mocks.EventHelperMock;
 import io.pravega.controller.mocks.EventStreamWriterMock;
 import io.pravega.controller.mocks.SegmentHelperMock;
 import io.pravega.controller.server.ControllerService;
@@ -38,12 +39,16 @@ import io.pravega.controller.store.client.StoreClientFactory;
 import io.pravega.controller.store.host.HostControllerStore;
 import io.pravega.controller.store.host.HostStoreFactory;
 import io.pravega.controller.store.host.impl.HostMonitorConfigImpl;
+import io.pravega.controller.store.kvtable.KVTableMetadataStore;
+import io.pravega.controller.store.stream.AbstractStreamMetadataStore;
 import io.pravega.controller.store.stream.BucketStore;
 import io.pravega.controller.store.stream.StreamMetadataStore;
 import io.pravega.controller.store.stream.StreamStoreFactory;
 import io.pravega.controller.store.task.TaskMetadataStore;
 import io.pravega.controller.store.task.TaskStoreFactoryForTests;
 import io.pravega.controller.stream.api.grpc.v1.Controller;
+import io.pravega.controller.task.EventHelper;
+import io.pravega.controller.task.KeyValueTable.TableMetadataTasks;
 import io.pravega.controller.task.Stream.StreamMetadataTasks;
 import io.pravega.controller.task.Stream.StreamTransactionMetadataTasks;
 import io.pravega.test.common.TestingServerStarter;
@@ -56,6 +61,7 @@ import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.curator.test.TestingServer;
 import org.junit.Assert;
 import org.junit.Test;
+import org.mockito.Mock;
 
 import static org.junit.Assert.assertEquals;
 
@@ -75,6 +81,10 @@ public class ZKControllerServiceImplTest extends ControllerServiceImplTest {
     private StreamTransactionMetadataTasks streamTransactionMetadataTasks;
     private Cluster cluster;
     private StreamMetadataStore streamStore;
+    @Mock
+    private KVTableMetadataStore kvtStore;
+    @Mock
+    private TableMetadataTasks kvtMetadataTasks;
 
     @Override
     public void setup() throws Exception {
@@ -96,9 +106,9 @@ public class ZKControllerServiceImplTest extends ControllerServiceImplTest {
         hostStore = HostStoreFactory.createInMemoryStore(HostMonitorConfigImpl.dummyConfig());
         streamStore = StreamStoreFactory.createZKStore(zkClient, executorService);
         BucketStore bucketStore = StreamStoreFactory.createZKBucketStore(zkClient, executorService);
-
+        EventHelper helperMock = EventHelperMock.getEventHelperMock(executorService, "host", ((AbstractStreamMetadataStore) streamStore).getHostTaskIndex());
         streamMetadataTasks = new StreamMetadataTasks(streamStore, bucketStore, taskMetadataStore, segmentHelper,
-                executorService, "host", GrpcAuthHelper.getDisabledAuthHelper(), requestTracker);
+                executorService, "host", GrpcAuthHelper.getDisabledAuthHelper(), requestTracker, helperMock);
         streamTransactionMetadataTasks = new StreamTransactionMetadataTasks(streamStore, segmentHelper,
                 executorService, "host", GrpcAuthHelper.getDisabledAuthHelper());
         this.streamRequestHandler = new StreamRequestHandler(new AutoScaleTask(streamMetadataTasks, streamStore, executorService),
@@ -120,7 +130,7 @@ public class ZKControllerServiceImplTest extends ControllerServiceImplTest {
         cluster.registerHost(new Host("localhost", 9090, null));
         latch.await();
 
-        ControllerService controller = new ControllerService(streamStore, bucketStore, streamMetadataTasks,
+        ControllerService controller = new ControllerService(kvtStore, kvtMetadataTasks, streamStore, bucketStore, streamMetadataTasks,
                 streamTransactionMetadataTasks, segmentHelper, executorService, cluster);
         controllerService = new ControllerServiceImpl(controller, GrpcAuthHelper.getDisabledAuthHelper(), requestTracker, true, 2);
     }

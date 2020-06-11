@@ -7,7 +7,7 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
-package io.pravega.controller.store.stream;
+package io.pravega.controller.store;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
@@ -24,6 +24,7 @@ import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
+import io.pravega.controller.store.stream.StoreException;
 
 /**
  * InMemory implementation of Scope.
@@ -36,7 +37,12 @@ public class InMemoryScope implements Scope {
     private TreeMap<Integer, String> sortedStreamsInScope;
     private HashMap<String, Integer> streamsPositionMap;
 
-    InMemoryScope(String scopeName) {
+    @GuardedBy("$lock")
+    private TreeMap<Integer, String> sortedKVTablesInScope;
+    private HashMap<String, Integer> kvTablesPositionMap;
+
+
+    public InMemoryScope(String scopeName) {
         this.scopeName = scopeName;
     }
 
@@ -50,6 +56,8 @@ public class InMemoryScope implements Scope {
     public CompletableFuture<Void> createScope() {
         this.sortedStreamsInScope = new TreeMap<>(Integer::compare);
         this.streamsPositionMap = new HashMap<>();
+        this.sortedKVTablesInScope = new TreeMap<>(Integer::compare);
+        this.kvTablesPositionMap =  new HashMap<>();
         return CompletableFuture.completedFuture(null);
     }
 
@@ -60,6 +68,12 @@ public class InMemoryScope implements Scope {
         this.sortedStreamsInScope = null;
         this.streamsPositionMap.clear();
         this.streamsPositionMap = null;
+
+        this.sortedKVTablesInScope.clear();
+        this.sortedKVTablesInScope = null;
+        this.kvTablesPositionMap.clear();
+        this.kvTablesPositionMap = null;
+
         return CompletableFuture.completedFuture(null);
     }
 
@@ -69,6 +83,16 @@ public class InMemoryScope implements Scope {
         streamsPositionMap.putIfAbsent(stream, next);
         Integer position = streamsPositionMap.get(stream);
         sortedStreamsInScope.put(position, stream);
+
+        return CompletableFuture.completedFuture(null);
+    }
+
+    @Synchronized
+    public CompletableFuture<Void> addKVTableToScope(String kvt) {
+        int next = kvTablesPositionMap.size();
+        kvTablesPositionMap.putIfAbsent(kvt, next);
+        Integer position = kvTablesPositionMap.get(kvt);
+        sortedKVTablesInScope.put(position, kvt);
 
         return CompletableFuture.completedFuture(null);
     }
@@ -121,6 +145,5 @@ public class InMemoryScope implements Scope {
 
     @Override
     public void refresh() {
-
     }
 }

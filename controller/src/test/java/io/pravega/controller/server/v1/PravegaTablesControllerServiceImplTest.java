@@ -24,6 +24,7 @@ import io.pravega.common.tracing.RequestTracker;
 import io.pravega.controller.metrics.StreamMetrics;
 import io.pravega.controller.metrics.TransactionMetrics;
 import io.pravega.controller.mocks.ControllerEventStreamWriterMock;
+import io.pravega.controller.mocks.EventHelperMock;
 import io.pravega.controller.mocks.EventStreamWriterMock;
 import io.pravega.controller.mocks.SegmentHelperMock;
 import io.pravega.controller.server.ControllerService;
@@ -39,12 +40,16 @@ import io.pravega.controller.server.rpc.auth.GrpcAuthHelper;
 import io.pravega.controller.server.rpc.grpc.v1.ControllerServiceImpl;
 import io.pravega.controller.store.client.StoreClient;
 import io.pravega.controller.store.client.StoreClientFactory;
+import io.pravega.controller.store.kvtable.KVTableMetadataStore;
+import io.pravega.controller.store.stream.AbstractStreamMetadataStore;
 import io.pravega.controller.store.stream.BucketStore;
 import io.pravega.controller.store.stream.State;
 import io.pravega.controller.store.stream.StreamMetadataStore;
 import io.pravega.controller.store.stream.StreamStoreFactory;
 import io.pravega.controller.store.task.TaskMetadataStore;
 import io.pravega.controller.store.task.TaskStoreFactoryForTests;
+import io.pravega.controller.task.EventHelper;
+import io.pravega.controller.task.KeyValueTable.TableMetadataTasks;
 import io.pravega.controller.stream.api.grpc.v1.Controller;
 import io.pravega.controller.task.Stream.StreamMetadataTasks;
 import io.pravega.controller.task.Stream.StreamTransactionMetadataTasks;
@@ -61,8 +66,8 @@ import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.curator.test.TestingServer;
+import org.mockito.Mock;
 import org.junit.Test;
-
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
@@ -83,6 +88,10 @@ public class PravegaTablesControllerServiceImplTest extends ControllerServiceImp
     private Cluster cluster;
     private StreamMetadataStore streamStore;
     private SegmentHelper segmentHelper;
+    @Mock
+    private KVTableMetadataStore kvtStore;
+    @Mock
+    private TableMetadataTasks kvtMetadataTasks;
 
     @Override
     public void setup() throws Exception {
@@ -103,9 +112,9 @@ public class PravegaTablesControllerServiceImplTest extends ControllerServiceImp
         streamStore = StreamStoreFactory.createPravegaTablesStore(segmentHelper, GrpcAuthHelper.getDisabledAuthHelper(), 
                 zkClient, executorService);
         BucketStore bucketStore = StreamStoreFactory.createZKBucketStore(zkClient, executorService);
-
+        EventHelper helperMock = EventHelperMock.getEventHelperMock(executorService, "host", ((AbstractStreamMetadataStore) streamStore).getHostTaskIndex());
         streamMetadataTasks = new StreamMetadataTasks(streamStore, bucketStore, taskMetadataStore, segmentHelper,
-                executorService, "host", GrpcAuthHelper.getDisabledAuthHelper(), requestTracker);
+                executorService, "host", GrpcAuthHelper.getDisabledAuthHelper(), requestTracker, helperMock);
         streamTransactionMetadataTasks = new StreamTransactionMetadataTasks(streamStore, segmentHelper,
                 executorService, "host", GrpcAuthHelper.getDisabledAuthHelper());
         this.streamRequestHandler = spy(new StreamRequestHandler(new AutoScaleTask(streamMetadataTasks, streamStore, executorService),
@@ -127,7 +136,7 @@ public class PravegaTablesControllerServiceImplTest extends ControllerServiceImp
         cluster.registerHost(new Host("localhost", 9090, null));
         latch.await();
 
-        ControllerService controller = new ControllerService(streamStore, bucketStore, streamMetadataTasks,
+        ControllerService controller = new ControllerService(kvtStore, kvtMetadataTasks, streamStore, bucketStore, streamMetadataTasks,
                 streamTransactionMetadataTasks, segmentHelper, executorService, cluster);
         controllerService = new ControllerServiceImpl(controller, GrpcAuthHelper.getDisabledAuthHelper(), requestTracker, true, 2);
     }
