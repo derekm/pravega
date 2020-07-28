@@ -1,0 +1,61 @@
+# This workflow will build a Java project with Gradle
+# For more information see: https://help.github.com/actions/language-and-framework-guides/building-and-testing-java-with-gradle
+
+name: Java CI with Gradle
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v1
+    - name: Cache
+      uses: actions/cache@v2.1.0
+      with:
+        # A list of files, directories, and wildcard patterns to cache and restore
+        path: |
+          .gradle
+          ~/.gradle
+          ~/.m2
+        # An explicit key for restoring and saving the cache
+        key: gradle-m2
+        # An ordered list of keys to use for restoring the cache if no cache hit occurred for key
+        restore-keys: # optional
+    - name: Set up JDK 1.8
+      uses: actions/setup-java@v1
+      with:
+        java-version: 1.8
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+    - name: Build with Gradle
+      run: ./gradlew assemble
+    - name: Check with Gradle
+      run: ./gradlew check
+    - name: Codecov
+      uses: codecov/codecov-action@v1.0.12
+      with:
+        # User defined upload name. Visible in Codecov UI
+        name: # optional
+        # Repository upload token - get it from codecov.io. Required only for private repositories
+        token: ${{ secrets.CODECOV_TOKEN }}
+        # Path to coverage file to upload
+        file: # optional
+        # Comma-separated list of files to upload
+        files: # optional
+        # Directory to search for coverage reports.
+        directory: # optional
+        # Flag upload to group coverage metrics (e.g. unittests | integration | ui,chrome)
+        flags: # optional
+        # Write upload file to path before uploading
+        path_to_write_report: # optional
+        # Environment variables to tag the upload with (e.g. PYTHON | OS,PYTHON)
+        env_vars: # optional
+        # Specify whether or not CI build should fail if Codecov runs into an error during upload
+        fail_ci_if_error: # optional
