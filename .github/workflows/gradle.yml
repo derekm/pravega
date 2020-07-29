@@ -38,6 +38,8 @@ jobs:
       run: ./gradlew assemble
     - name: Check with Gradle
       run: ./gradlew check
+    - name: Javadoc with Gradle
+      run: ./gradlew javadocs
     - name: Codecov
       uses: codecov/codecov-action@v1.0.12
       with:
