@@ -64,7 +64,8 @@ class ControllerResolverFactory extends NameResolver.Factory {
 
     @Nullable
     @Override
-    public NameResolver newNameResolver(URI targetUri, NameResolver.Args params) {
+    @SuppressWarnings("deprecation")
+    public NameResolver newNameResolver(URI targetUri, Attributes params) {
         final String scheme = targetUri.getScheme();
         if (!SCHEME_DISCOVER.equals(scheme) && !SCHEME_DISCOVER_TLS.equals(scheme) &&
                 !SCHEME_DIRECT.equals(scheme) && !SCHEME_DIRECT_SSL.equals(scheme) && !SCHEME_DIRECT_TLS.equals(scheme)) {
