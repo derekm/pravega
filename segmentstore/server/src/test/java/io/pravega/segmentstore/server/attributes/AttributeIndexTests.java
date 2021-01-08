@@ -11,10 +11,14 @@ package io.pravega.segmentstore.server.attributes;
 
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.io.StreamHelpers;
+import io.pravega.common.util.ByteArraySegment;
 import io.pravega.segmentstore.contracts.Attributes;
+import io.pravega.segmentstore.contracts.SegmentProperties;
 import io.pravega.segmentstore.contracts.StreamSegmentException;
+import io.pravega.segmentstore.contracts.StreamSegmentInformation;
 import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
 import io.pravega.segmentstore.contracts.StreamSegmentSealedException;
+import io.pravega.segmentstore.contracts.StreamSegmentTruncatedException;
 import io.pravega.segmentstore.server.AttributeIndex;
 import io.pravega.segmentstore.server.CachePolicy;
 import io.pravega.segmentstore.server.DataCorruptionException;
@@ -35,6 +39,7 @@ import io.pravega.test.common.ThreadPooledTestSuite;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.time.Duration;
+import java.util.AbstractMap;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -42,9 +47,11 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -418,12 +425,14 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
         val attributeId = UUID.randomUUID();
         val lastWrittenValue = new AtomicLong(0);
         val config = AttributeIndexConfig.builder()
-                                         .with(AttributeIndexConfig.ATTRIBUTE_SEGMENT_ROLLING_SIZE, 10) // Very, very frequent rollovers.
-                                         .build();
+                .with(AttributeIndexConfig.ATTRIBUTE_SEGMENT_ROLLING_SIZE, 10) // Very, very frequent rollovers.
+                .build();
         @Cleanup
         val context = new TestContext(config);
         populateSegments(context);
-        val idx = (SegmentAttributeBTreeIndex) context.index.forSegment(SEGMENT_ID, TIMEOUT).join();
+        @Cleanup
+        val idx = new TestSegmentAttributeBTreeIndex(config, context);
+        idx.initialize(TIMEOUT).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
         // Write one value.
         idx.update(Collections.singletonMap(attributeId, lastWrittenValue.incrementAndGet()), TIMEOUT).join();
@@ -435,10 +444,10 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
         val intercepted = new AtomicBoolean(false);
         val blockRead = new CompletableFuture<Void>();
         val waitForInterception = new CompletableFuture<Void>();
-        context.storage.readInterceptor = (name, offset, storage) -> {
+        idx.readPageInterceptor = (handle, offset, length) -> {
             if (intercepted.compareAndSet(false, true)) {
                 // This should attempt to read the Root Page; return the future to wait on and clear the interceptor.
-                context.storage.readInterceptor = null;
+                idx.readPageInterceptor = null;
                 waitForInterception.complete(null);
                 return blockRead;
             } else {
@@ -461,6 +470,98 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
         Assert.assertEquals("Unexpected id read.", attributeId, attributePair.getKey());
         Assert.assertEquals("Unexpected value read.", lastWrittenValue.get(), (long) attributePair.getValue());
         Assert.assertTrue("No interception done.", intercepted.get());
+    }
+
+    /**
+     * Tests a scenario where multiple, concurrent reads are received for the same BTreeIndex pages. Verifies that no
+     * two concurrent reads for the same page are issued to Storage (subsequent ones are piggybacked onto the first one).
+     */
+    @Test
+    public void testConcurrentReads() throws Exception {
+        val config = AttributeIndexConfig.builder()
+                .with(AttributeIndexConfig.MAX_INDEX_PAGE_SIZE, 1024)
+                .with(AttributeIndexConfig.ATTRIBUTE_SEGMENT_ROLLING_SIZE, 4096)
+                .build();
+        val attributeCount = config.getMaxIndexPageSize() / 16;
+        val attributes = IntStream.range(0, attributeCount).boxed()
+                .collect(Collectors.toMap(value -> UUID.randomUUID(), value -> (long) value));
+        @Cleanup
+        val context = new TestContext(config);
+        populateSegments(context);
+        @Cleanup
+        val idx = new TestSegmentAttributeBTreeIndex(config, context);
+        idx.initialize(TIMEOUT).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        val writeBytes = new AtomicInteger(0);
+        context.storage.writeInterceptor = (name, offset, data, length, wrappedStorage) -> {
+            writeBytes.addAndGet(length);
+            return CompletableFuture.completedFuture(false); // Not interfering with the actual write.
+        };
+
+        // Write all the values.
+        idx.update(attributes, TIMEOUT).join();
+        context.storage.writeInterceptor = null;
+        AssertExtensions.assertGreaterThan("Needing to write at least 2 pages.", config.getMaxIndexPageSize(), writeBytes.get());
+
+        // Clear the cache so we are guaranteed to attempt to read from Storage.
+        idx.removeAllCacheEntries();
+
+        // Keep count of the read requests made to storage (Key = Offset&Length, Value = Count).
+        val readCounts = Collections.synchronizedMap(new HashMap<Map.Entry<Long, Integer>, AtomicInteger>());
+
+        // Every Storage Read is blocked (by offset & length).
+        val readBlocks = Collections.synchronizedMap(new HashMap<Map.Entry<Long, Integer>, CompletableFuture<Void>>());
+        context.storage.readInterceptor = (name, offset, length, wrappedStorage) -> {
+            val key = new AbstractMap.SimpleImmutableEntry<>(offset, length);
+            val cnt = readCounts.computeIfAbsent(key, e -> new AtomicInteger(0));
+            val result = readBlocks.computeIfAbsent(key, e -> new CompletableFuture<>());
+            cnt.incrementAndGet();
+            return result;
+        };
+
+        // Issue 2 concurrent reads. Since we have a 2-level index, this should block initially on the root page being read,
+        // and then on the 2 leaf pages that we have.
+        val get1 = idx.get(attributes.keySet(), TIMEOUT);
+        Assert.assertFalse(get1.isDone());
+        val get2 = idx.get(attributes.keySet(), TIMEOUT);
+        Assert.assertFalse(get2.isDone());
+
+        // Verify that only one attempt was made to read from Storage.
+        AssertExtensions.assertEventuallyEquals("Expected 1 read (root page) to be blocked.", 1, readCounts::size, 10, TIMEOUT.toMillis());
+        val rootPageBlockCount = readCounts.entrySet().stream().findFirst().get();
+        int expectedPageBlockCount = 1;
+        Assert.assertEquals("Expected one attempt to read root page from Storage.", expectedPageBlockCount, rootPageBlockCount.getValue().get());
+
+        // Unblock the root read.
+        val rootPageBLock = readBlocks.entrySet().stream().findFirst().get();
+        rootPageBLock.getValue().complete(null);
+
+        expectedPageBlockCount += 2; // 2 Non-root (leaf) pages.
+        AssertExtensions.assertEventuallyEquals("Expected 2 leaf page reads to be blocked.", expectedPageBlockCount, readCounts::size, 10, TIMEOUT.toMillis());
+
+        // Unblock everything and get the results.
+        readBlocks.values().forEach(f -> f.complete(null));
+        val result1 = get1.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        val result2 = get2.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        AssertExtensions.assertMapEquals("Unexpected result 1.", attributes, result1);
+        AssertExtensions.assertMapEquals("Unexpected result 2.", attributes, result2);
+
+        // Issue the request again. Validate that it never touches the Storage (cached).
+        context.storage.readInterceptor = (name, offset, length, wrappedStorage) -> {
+            Assert.fail("Not expecting a Storage read.");
+            return null;
+        };
+        val get3 = idx.get(attributes.keySet(), TIMEOUT);
+        val result3 = get3.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        AssertExtensions.assertMapEquals("Unexpected result 3 (from cache).", attributes, result3);
+
+        for (val cnt : readCounts.entrySet()) {
+            Assert.assertEquals("Expected a single storage read attempt for " + cnt.getKey(), 1, cnt.getValue().get());
+        }
+
+        for (val block : readBlocks.entrySet()) {
+            Assert.assertTrue("Expected all reads to be unblocked for " + block.getKey(), block.getValue().isDone());
+        }
     }
 
     /**
@@ -493,7 +594,7 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
         idx.update(expectedValues, TIMEOUT).join();
 
         // Everything should already be cached, so four our first check we don't expect any Storage reads.
-        context.storage.readInterceptor = (String streamSegmentName, long offset, SyncStorage wrappedStorage) ->
+        context.storage.readInterceptor = (String streamSegmentName, long offset, int length, SyncStorage wrappedStorage) ->
                 Futures.failedFuture(new AssertionError("Not expecting storage reads yet."));
         checkIndex(idx, expectedValues);
         val cacheStatus = idx.getCacheStatus();
@@ -504,7 +605,7 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
 
         // Re-check the index and verify at least one Storage Read happened.
         AtomicBoolean intercepted = new AtomicBoolean(false);
-        context.storage.readInterceptor = (String streamSegmentName, long offset, SyncStorage wrappedStorage) -> {
+        context.storage.readInterceptor = (String streamSegmentName, long offset, int length, SyncStorage wrappedStorage) -> {
             intercepted.set(true);
             return CompletableFuture.completedFuture(null);
         };
@@ -616,12 +717,78 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
         // directly from Storage.
         context.index.cleanup(null);
         val storageRead = new AtomicBoolean();
-        context.storage.readInterceptor = (name, offset, storage) -> CompletableFuture.runAsync(() -> storageRead.set(true));
+        context.storage.readInterceptor = (name, offset, length, storage) -> CompletableFuture.runAsync(() -> storageRead.set(true));
         val idx2 = context.index.forSegment(SEGMENT_ID, TIMEOUT).join();
         checkIndex(idx2, expectedValues);
         Assert.assertTrue("Expecting storage reads after reload.", storageRead.get());
 
         // 4. Remove all values (and thus force an update - validates conditional updates still work in this case).
+        idx2.update(toDelete(expectedValues.keySet()), TIMEOUT).join();
+        expectedValues.replaceAll((key, v) -> Attributes.NULL_ATTRIBUTE_VALUE);
+        checkIndex(idx2, expectedValues);
+    }
+
+    /**
+     * Tests the ability of the Attribute Index to recover correctly after an update has been successfully written to Storage,
+     * but the previous value of the {@link Attributes#ATTRIBUTE_SEGMENT_ROOT_POINTER} has been truncated out without
+     * having the new value persisted (most likely due to a system crash).
+     * In this case, the {@link Attributes#ATTRIBUTE_SEGMENT_ROOT_POINTER} value should be ignored and the index should
+     * be attempted to be read from Storage without providing hints to where to start reading from.
+     */
+    @Test
+    public void testTruncatedRootPointer() {
+        val attributeSegmentName = NameUtils.getAttributeSegmentName(SEGMENT_NAME);
+        val config = AttributeIndexConfig
+                .builder()
+                .with(AttributeIndexConfig.MAX_INDEX_PAGE_SIZE, 1024)
+                .with(AttributeIndexConfig.ATTRIBUTE_SEGMENT_ROLLING_SIZE, 8)
+                .build();
+        final int attributeCount = 20;
+        val attributes = IntStream.range(0, attributeCount).mapToObj(i -> new UUID(i, i)).collect(Collectors.toList());
+        @Cleanup
+        val context = new TestContext(config);
+        populateSegments(context);
+
+        // 1. Populate and verify first index.
+        val expectedValues = new HashMap<UUID, Long>();
+        long nextValue = 0;
+        long previousRootPointer = -1;
+        boolean invalidRootPointer = false;
+        for (UUID attributeId : attributes) {
+            val idx = context.index.forSegment(SEGMENT_ID, TIMEOUT).join();
+
+            val value = nextValue++;
+            expectedValues.put(attributeId, value);
+            val updateBatch = Collections.singletonMap(attributeId, value);
+
+            val rootPointer = idx.update(updateBatch, TIMEOUT).join();
+            val startOffset = context.storage.getStreamSegmentInfo(attributeSegmentName, TIMEOUT).join().getStartOffset();
+            if (previousRootPointer >= 0) {
+                // We always set the Root Pointer to be one "value behind". Since we truncate the Attribute Segment with
+                // every update (small rolling size), doing this ensures that its value should always be less than the
+                // segment's start offset. This is further validated by asserting that invalidRootPointer is true at the
+                // end of this loop.
+                context.containerMetadata.getStreamSegmentMetadata(SEGMENT_ID)
+                        .updateAttributes(Collections.singletonMap(Attributes.ATTRIBUTE_SEGMENT_ROOT_POINTER, previousRootPointer));
+                invalidRootPointer |= previousRootPointer < startOffset;
+            }
+
+            previousRootPointer = rootPointer;
+
+            // Clean up the index cache and force a reload. Verify that we can read from the index.
+            context.index.cleanup(null);
+            val storageRead = new AtomicBoolean();
+            context.storage.readInterceptor = (name, offset, length, storage) -> CompletableFuture.runAsync(() -> storageRead.set(true));
+            val idx2 = context.index.forSegment(SEGMENT_ID, TIMEOUT).join();
+            checkIndex(idx2, expectedValues);
+            Assert.assertTrue("Expecting storage reads after reload.", storageRead.get());
+        }
+
+        Assert.assertTrue("No invalid Root Pointers generated during the test.", invalidRootPointer);
+
+        // 3. Remove all values (and thus force an update - validates conditional updates still work in this case).
+        context.index.cleanup(null);
+        val idx2 = context.index.forSegment(SEGMENT_ID, TIMEOUT).join();
         idx2.update(toDelete(expectedValues.keySet()), TIMEOUT).join();
         expectedValues.replaceAll((key, v) -> Attributes.NULL_ATTRIBUTE_VALUE);
         checkIndex(idx2, expectedValues);
@@ -672,7 +839,7 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
 
         // Record every time we read from Storage.
         AtomicBoolean storageRead = new AtomicBoolean(false);
-        context.storage.readInterceptor = (name, offset, storage) -> CompletableFuture.runAsync(() -> storageRead.set(true));
+        context.storage.readInterceptor = (name, offset, length, storage) -> CompletableFuture.runAsync(() -> storageRead.set(true));
 
         // Populate data.
         val updateBatch = new HashMap<UUID, Long>();
@@ -771,6 +938,7 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
 
         private class TestStorage extends AsyncStorageWrapper {
             private final SyncStorage wrappedStorage;
+            private final Map<String, Long> startOffsets;
             private WriteInterceptor writeInterceptor;
             private SealInterceptor sealInterceptor;
             private ReadInterceptor readInterceptor;
@@ -778,6 +946,31 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
             TestStorage(SyncStorage syncStorage, Executor executor) {
                 super(syncStorage, executor);
                 this.wrappedStorage = syncStorage;
+                this.startOffsets = new ConcurrentHashMap<>();
+            }
+
+            @Override
+            public CompletableFuture<Void> truncate(SegmentHandle handle, long offset, Duration timeout) {
+                // We need to simulate the ChunkedSegmentStorage (correct) behavior for truncating segments. While the
+                // legacy RollingStorage would approximate a StartOffset to an offset at most equal to the requested
+                // Truncation Offset, the ChunkedSegmentStorage is very strict about that, so it will deny any read prior
+                // to that offset. In addition, the ChunkedSegmentStorage also returns the correct StartOffset as part of
+                // getStreamSegmentInfo while RollingStorage does not.
+                return super.truncate(handle, offset, timeout)
+                        .thenRun(() -> this.startOffsets.put(handle.getSegmentName(), offset));
+            }
+
+            @Override
+            public CompletableFuture<SegmentProperties> getStreamSegmentInfo(String streamSegmentName, Duration timeout) {
+                return super.getStreamSegmentInfo(streamSegmentName, timeout)
+                        .thenApply(si -> {
+                            val startOffset = this.startOffsets.getOrDefault(streamSegmentName, -1L);
+                            if (startOffset >= 0) {
+                                return StreamSegmentInformation.from(si).startOffset(startOffset).build();
+                            } else {
+                                return si;
+                            }
+                        });
             }
 
             @Override
@@ -793,9 +986,14 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
 
             @Override
             public CompletableFuture<Integer> read(SegmentHandle handle, long offset, byte[] buffer, int bufferOffset, int length, Duration timeout) {
+                val startOffset = this.startOffsets.getOrDefault(handle.getSegmentName(), -1L);
+                if (startOffset >= 0 && offset < startOffset) {
+                    return Futures.failedFuture(new StreamSegmentTruncatedException(handle.getSegmentName(), startOffset, offset));
+                }
+
                 ReadInterceptor ri = this.readInterceptor;
                 if (ri != null) {
-                    return ri.apply(handle.getSegmentName(), offset, this.wrappedStorage)
+                    return ri.apply(handle.getSegmentName(), offset, length, this.wrappedStorage)
                             .thenCompose(v -> super.read(handle, offset, buffer, bufferOffset, length, timeout));
                 } else {
                     return super.read(handle, offset, buffer, bufferOffset, length, timeout);
@@ -815,6 +1013,25 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
         }
     }
 
+    private class TestSegmentAttributeBTreeIndex extends SegmentAttributeBTreeIndex {
+        private ReadPageInterceptor readPageInterceptor;
+
+        TestSegmentAttributeBTreeIndex(AttributeIndexConfig config, TestContext context) {
+            super(context.containerMetadata.getStreamSegmentMetadata(SEGMENT_ID), context.storage, context.cacheStorage,
+                    config, executorService());
+        }
+
+        @Override
+        CompletableFuture<ByteArraySegment> readPageFromStorage(SegmentHandle handle, long offset, int length, Duration timeout) {
+            val interceptor = this.readPageInterceptor;
+            if (interceptor != null) {
+                return interceptor.apply(handle, offset, length)
+                        .thenCompose(v -> super.readPageFromStorage(handle, offset, length, timeout));
+            }
+            return super.readPageFromStorage(handle, offset, length, timeout);
+        }
+    }
+
     @FunctionalInterface
     interface WriteInterceptor {
         CompletableFuture<Boolean> apply(String streamSegmentName, long offset, InputStream data, int length, SyncStorage wrappedStorage);
@@ -827,7 +1044,12 @@ public class AttributeIndexTests extends ThreadPooledTestSuite {
 
     @FunctionalInterface
     interface ReadInterceptor {
-        CompletableFuture<Void> apply(String streamSegmentName, long offset, SyncStorage wrappedStorage);
+        CompletableFuture<Void> apply(String streamSegmentName, long offset, int length, SyncStorage wrappedStorage);
+    }
+
+    @FunctionalInterface
+    interface ReadPageInterceptor {
+        CompletableFuture<Void> apply(SegmentHandle handle, long offset, int length);
     }
 
     //endregion

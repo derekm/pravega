@@ -15,7 +15,6 @@ import io.pravega.common.ObjectClosedException;
 import io.pravega.common.util.ByteArraySegment;
 import io.pravega.common.util.CloseableIterator;
 import io.pravega.common.util.CompositeArrayView;
-import io.pravega.common.util.SequencedItemList;
 import io.pravega.segmentstore.contracts.StreamSegmentException;
 import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
 import io.pravega.segmentstore.contracts.StreamSegmentSealedException;
@@ -23,13 +22,16 @@ import io.pravega.segmentstore.server.CacheManager;
 import io.pravega.segmentstore.server.CachePolicy;
 import io.pravega.segmentstore.server.MetadataBuilder;
 import io.pravega.segmentstore.server.ReadIndex;
+import io.pravega.segmentstore.server.SegmentStoreMetrics;
 import io.pravega.segmentstore.server.ServiceListeners;
 import io.pravega.segmentstore.server.TestDurableDataLog;
 import io.pravega.segmentstore.server.TruncationMarkerRepository;
 import io.pravega.segmentstore.server.UpdateableContainerMetadata;
 import io.pravega.segmentstore.server.logs.operations.CheckpointOperationBase;
+import io.pravega.segmentstore.server.logs.operations.MetadataCheckpointOperation;
 import io.pravega.segmentstore.server.logs.operations.Operation;
 import io.pravega.segmentstore.server.logs.operations.OperationComparer;
+import io.pravega.segmentstore.server.logs.operations.OperationPriority;
 import io.pravega.segmentstore.server.logs.operations.OperationSerializer;
 import io.pravega.segmentstore.server.logs.operations.StorageOperation;
 import io.pravega.segmentstore.server.logs.operations.StreamSegmentAppendOperation;
@@ -41,15 +43,14 @@ import io.pravega.segmentstore.storage.DurableDataLogException;
 import io.pravega.segmentstore.storage.LogAddress;
 import io.pravega.segmentstore.storage.QueueStats;
 import io.pravega.segmentstore.storage.Storage;
-import io.pravega.segmentstore.storage.cache.CacheStorage;
-import io.pravega.segmentstore.storage.cache.DirectMemoryCache;
 import io.pravega.segmentstore.storage.ThrottleSourceListener;
 import io.pravega.segmentstore.storage.WriteSettings;
+import io.pravega.segmentstore.storage.cache.CacheStorage;
+import io.pravega.segmentstore.storage.cache.DirectMemoryCache;
 import io.pravega.segmentstore.storage.mocks.InMemoryStorageFactory;
 import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.ErrorInjector;
 import io.pravega.test.common.IntentionalException;
-import io.pravega.test.common.TestUtils;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.AbstractMap;
@@ -60,14 +61,21 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import lombok.Cleanup;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
 import lombok.val;
 import org.junit.Assert;
 import org.junit.Rule;
@@ -389,7 +397,7 @@ public class OperationProcessorTests extends OperationLogTestBase {
 
         // Create a different state updater and Memory log - and use these throughout this test.
         CorruptedMemoryOperationLog corruptedMemoryLog = new CorruptedMemoryOperationLog(failAtOperationIndex);
-        MemoryStateUpdater stateUpdater = new MemoryStateUpdater(corruptedMemoryLog, context.readIndex, Runnables.doNothing());
+        MemoryStateUpdater stateUpdater = new MemoryStateUpdater(corruptedMemoryLog, context.readIndex);
 
         // Generate some test data (no need to complicate ourselves with Transactions here; that is tested in the no-failure test).
         HashSet<Long> streamSegmentIds = createStreamSegmentsInMetadata(streamSegmentCount, context.metadata);
@@ -486,18 +494,76 @@ public class OperationProcessorTests extends OperationLogTestBase {
                 ex -> ex instanceof CancellationException || ex instanceof ObjectClosedException);
     }
 
+    /**
+     * Tests throttling and Operation Priorities.
+     */
+    @Test
+    public void testThrottlingAndPriorities() throws Exception {
+        @Cleanup
+        TestContext context = new TestContext();
+
+        // Generate some test data.
+        //val segmentId = createStreamSegmentsInMetadata(1, context.metadata).stream().findFirst().orElse(-1L);
+        val op1 = new MetadataCheckpointOperation();
+        val op2 = new MetadataCheckpointOperation();
+
+        // Setup a ThrottledOperationProcessor with a ManualThrottler and start it.
+        @Cleanup
+        TestDurableDataLog dataLog = TestDurableDataLog.create(CONTAINER_ID, MAX_DATA_LOG_APPEND_SIZE, executorService());
+        dataLog.initialize(TIMEOUT);
+
+        val interrupted = new AtomicBoolean(false);
+        @Cleanup
+        val throttler = new ManualThrottler(() -> interrupted.set(true), executorService());
+        @Cleanup
+        val operationProcessor = new ThrottledOperationProcessor(context.metadata, context.stateUpdater,
+                dataLog, getNoOpCheckpointPolicy(), executorService(), throttler);
+        operationProcessor.startAsync().awaitRunning();
+
+        // Block processing of operations.
+        throttler.setThrottleEnabled(true);
+
+        // Queue up OP1 with Normal priority (should be subject to throttling).
+        val op1Future = operationProcessor.process(op1, OperationPriority.Normal);
+
+        // Check if we are currently throttling. This is sometimes set in a background thread so we need to use assertEventuallyEquals.
+        AssertExtensions.assertEventuallyEquals(true, throttler::isCurrentlyThrottling, TIMEOUT.toMillis());
+        Assert.assertTrue("Expected to be throttling at this point.", throttler.isCurrentlyThrottling());
+        Assert.assertFalse("Not expected OP1 to be complete yet.", op1Future.isDone());
+        Assert.assertFalse("Not expected an interruption yet.", interrupted.get());
+
+        // Queue up OP2 with Critical priority (should interrupt throttling and execute first).
+        val op2Future = operationProcessor.process(op2, OperationPriority.Critical);
+        Assert.assertTrue("Still expecting throttling to be happening.", throttler.isCurrentlyThrottling());
+        Assert.assertFalse("Not expecting OP2 to be complete yet.", op2Future.isDone());
+        Assert.assertTrue("Expected interruption due to Operation Priority.", interrupted.get());
+
+        // Terminate the throttling delay and do not throttle anymore.
+        throttler.setThrottleEnabled(false);
+        throttler.completeDelayFuture();
+
+        // Wait for our operations to have completed.
+        CompletableFuture.allOf(op1Future, op2Future).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        // Verify that OP2 has executed prior to OP1.
+        AssertExtensions.assertGreaterThan("Expected OP2 (Critical) to have been executed prior to OP1 (Normal),",
+                op2.getSequenceNumber(), op1.getSequenceNumber());
+
+        operationProcessor.stopAsync().awaitTerminated();
+    }
+
     private List<OperationWithCompletion> processOperations(Collection<Operation> operations, OperationProcessor operationProcessor) {
         List<OperationWithCompletion> completionFutures = new ArrayList<>();
-        operations.forEach(op -> completionFutures.add(new OperationWithCompletion(op, operationProcessor.process(op))));
+        operations.forEach(op -> completionFutures.add(new OperationWithCompletion(op, operationProcessor.process(op, OperationPriority.Normal))));
         return completionFutures;
     }
 
-    private void performLogOperationChecks(Collection<OperationWithCompletion> operations, SequencedItemList<Operation> memoryLog,
+    private void performLogOperationChecks(Collection<OperationWithCompletion> operations, InMemoryLog memoryLog,
                                            DurableDataLog dataLog, TruncationMarkerRepository truncationMarkers) throws Exception {
         performLogOperationChecks(operations, memoryLog, dataLog, truncationMarkers, Integer.MAX_VALUE);
     }
 
-    private void performLogOperationChecks(Collection<OperationWithCompletion> operations, SequencedItemList<Operation> memoryLog,
+    private void performLogOperationChecks(Collection<OperationWithCompletion> operations, InMemoryLog memoryLog,
                                            DurableDataLog dataLog, TruncationMarkerRepository truncationMarkers, int maxCount) throws Exception {
         // Log Operation based checks
         val successfulOps = operations.stream()
@@ -509,13 +575,15 @@ public class OperationProcessorTests extends OperationLogTestBase {
         @Cleanup
         DataFrameReader<Operation> dataFrameReader = new DataFrameReader<>(dataLog, new OperationSerializer(), CONTAINER_ID);
         long lastSeqNo = -1;
-        if (successfulOps.size() > 0) {
-            // Writing to the memory log is asynchronous and we don't have any callbacks to know when it was written to.
-            // We check periodically until the last item has been written.
-            TestUtils.await(() -> memoryLog.read(successfulOps.get(successfulOps.size() - 1).getSequenceNumber() - 1, 1).hasNext(), 10, TIMEOUT.toMillis());
+
+        Iterator<Operation> memoryLogIterator;
+        if (successfulOps.isEmpty()) {
+            memoryLogIterator = Collections.emptyIterator();
+        } else {
+            val memoryLogOps = readUpToSequenceNumber(memoryLog, successfulOps.get(successfulOps.size() - 1).getSequenceNumber());
+            memoryLogIterator = memoryLogOps.iterator();
         }
 
-        Iterator<Operation> memoryLogIterator = memoryLog.read(-1, operations.size() + 1);
         OperationComparer memoryLogComparer = new OperationComparer(true);
         for (Operation expectedOp : successfulOps) {
             // Verify that the operations have been completed and assigned sequential Sequence Numbers.
@@ -575,6 +643,27 @@ public class OperationProcessorTests extends OperationLogTestBase {
         }
     }
 
+    @SneakyThrows
+    private List<Operation> readUpToSequenceNumber(InMemoryLog log, long seqNo) {
+        ArrayList<Operation> result = new ArrayList<>();
+        while (true) {
+            // Figure out if we've already reached our limit.
+            long afterSequence = result.size() == 0 ? -1 : result.get(result.size() - 1).getSequenceNumber();
+            if (afterSequence >= seqNo) {
+                break;
+            }
+
+            // Figure out how much to read. If we don't know, read at least one item so we see what's the first SeqNo
+            // in the Log.
+            int maxCount = result.size() == 0 ? 1 : (int) (seqNo - result.get(result.size() - 1).getSequenceNumber());
+            Queue<Operation> logIterator = log.take(maxCount, TIMEOUT, executorService()).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            while (!logIterator.isEmpty()) {
+                result.add(logIterator.poll());
+            }
+        }
+        return result;
+    }
+
     private MetadataCheckpointPolicy getNoOpCheckpointPolicy() {
         // Turn off any MetadataCheckpointing. In these tests, we are doing that manually.
         DurableLogConfig dlConfig = DurableLogConfig
@@ -589,7 +678,7 @@ public class OperationProcessorTests extends OperationLogTestBase {
     private class TestContext implements AutoCloseable {
         final CacheManager cacheManager;
         final Storage storage;
-        final SequencedItemList<Operation> memoryLog;
+        final InMemoryLog memoryLog;
         final CacheStorage cacheStorage;
         final UpdateableContainerMetadata metadata;
         final ReadIndex readIndex;
@@ -603,8 +692,8 @@ public class OperationProcessorTests extends OperationLogTestBase {
             this.cacheStorage = new DirectMemoryCache(Integer.MAX_VALUE);
             this.cacheManager = new CacheManager(CachePolicy.INFINITE, this.cacheStorage, executorService());
             this.readIndex = new ContainerReadIndex(readIndexConfig, this.metadata, this.storage, this.cacheManager, executorService());
-            this.memoryLog = new SequencedItemList<>();
-            this.stateUpdater = new MemoryStateUpdater(this.memoryLog, this.readIndex, Runnables.doNothing());
+            this.memoryLog = new InMemoryLog();
+            this.stateUpdater = new MemoryStateUpdater(this.memoryLog, this.readIndex);
         }
 
         @Override
@@ -613,9 +702,94 @@ public class OperationProcessorTests extends OperationLogTestBase {
             this.storage.close();
             this.cacheManager.close();
             this.cacheStorage.close();
+            this.memoryLog.close();
         }
     }
 
+    //region ThrottledOperationProcessor
+
+    private static class ThrottledOperationProcessor extends OperationProcessor {
+        @Getter
+        private final ManualThrottler throttler;
+
+        ThrottledOperationProcessor(UpdateableContainerMetadata metadata, MemoryStateUpdater stateUpdater,
+                                    DurableDataLog durableDataLog, MetadataCheckpointPolicy checkpointPolicy,
+                                    ScheduledExecutorService executor, ManualThrottler throttler) {
+            super(metadata, stateUpdater, durableDataLog, checkpointPolicy, executor);
+            this.throttler = throttler;
+        }
+    }
+
+    private static class ManualThrottler extends Throttler {
+        private final AtomicBoolean throttleEnabled = new AtomicBoolean(true);
+        private final AtomicReference<CompletableFuture<Void>> lastDelayFuture = new AtomicReference<>();
+        private final Runnable onNotifyThrottleSourceChanged;
+
+        ManualThrottler(Runnable onNotifyThrottleSourceChanged, ScheduledExecutorService executor) {
+            super(CONTAINER_ID, ThrottlerCalculator.builder().throttler(new NoOpCalculator()).build(), () -> false, executor,
+                    new SegmentStoreMetrics.OperationProcessor(CONTAINER_ID));
+            this.onNotifyThrottleSourceChanged = onNotifyThrottleSourceChanged;
+        }
+
+        void setThrottleEnabled(boolean enabled) {
+            this.throttleEnabled.set(enabled);
+        }
+
+        @Override
+        public boolean isThrottlingRequired() {
+            return this.throttleEnabled.get();
+        }
+
+        @Override
+        public CompletableFuture<Void> throttle() {
+            if (!this.throttleEnabled.get()) {
+                return CompletableFuture.completedFuture(null);
+            }
+
+            val oldDelay = this.lastDelayFuture.getAndSet(null);
+            Assert.assertTrue(oldDelay == null || oldDelay.isDone());
+            val result = new CompletableFuture<Void>();
+            this.lastDelayFuture.set(result);
+            return result;
+        }
+
+        @Override
+        public void notifyThrottleSourceChanged() {
+            this.onNotifyThrottleSourceChanged.run();
+        }
+
+        void completeDelayFuture() {
+            val delayFuture = this.lastDelayFuture.getAndSet(null);
+            Assert.assertNotNull(delayFuture);
+            delayFuture.complete(null);
+        }
+
+        boolean isCurrentlyThrottling() {
+            val d = this.lastDelayFuture.get();
+            return d != null && !d.isDone();
+        }
+    }
+
+    private static class NoOpCalculator extends ThrottlerCalculator.Throttler {
+        @Override
+        boolean isThrottlingRequired() {
+            return false;
+        }
+
+        @Override
+        int getDelayMillis() {
+            return 0;
+        }
+
+        @Override
+        ThrottlerCalculator.ThrottlerName getName() {
+            return ThrottlerCalculator.ThrottlerName.Batching;
+        }
+    }
+
+    //endregion
+
+    //endregion
 
     //region ManualAppendOnlyDurableDataLog
 

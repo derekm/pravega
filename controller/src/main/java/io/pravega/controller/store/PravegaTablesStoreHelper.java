@@ -26,7 +26,7 @@ import io.pravega.common.util.ContinuationTokenAsyncIterator;
 import io.pravega.common.util.RetriesExhaustedException;
 import io.pravega.controller.server.SegmentHelper;
 import io.pravega.controller.server.WireCommandFailedException;
-import io.pravega.controller.server.rpc.auth.GrpcAuthHelper;
+import io.pravega.controller.server.security.auth.GrpcAuthHelper;
 import io.pravega.controller.store.host.HostStoreException;
 import io.pravega.controller.store.stream.Cache;
 import io.pravega.controller.store.stream.StoreException;
@@ -84,13 +84,7 @@ public class PravegaTablesStoreHelper {
         this.segmentHelper = segmentHelper;
         this.executor = executor;
 
-        cache = new Cache(x -> {
-            TableCacheKey<?> entryKey = (TableCacheKey<?>) x;
-
-            // Since there are be multiple tables, we will cache `table+key` in our cache
-            return getEntry(entryKey.getTable(), entryKey.getKey(), entryKey.fromBytesFunc)
-                    .thenApply(v -> new VersionedMetadata<>(v.getObject(), v.getVersion()));
-        });
+        cache = new Cache();
         this.authHelper = authHelper;
         this.authToken = new AtomicReference<>(authHelper.retrieveMasterToken());
         this.numOfRetries = numOfRetries;
@@ -105,8 +99,18 @@ public class PravegaTablesStoreHelper {
      * @return Returns a completableFuture which when completed will have the deserialized value with its store key version.
      */
     public <T> CompletableFuture<VersionedMetadata<T>> getCachedData(String table, String key, Function<byte[], T> fromBytes) {
-        return cache.getCachedData(new TableCacheKey<>(table, key, fromBytes))
-                    .thenApply(this::getVersionedMetadata);
+        TableCacheKey<T> cacheKey = new TableCacheKey<>(table, key, fromBytes);
+        VersionedMetadata<?> cached = cache.getCachedData(cacheKey);
+        if (cached != null) {
+            return CompletableFuture.completedFuture(getVersionedMetadata(cached));
+        } else {
+            return getEntry(table, key, fromBytes)
+                    .thenApply(v -> {
+                        VersionedMetadata<T> record = new VersionedMetadata<>(v.getObject(), v.getVersion());
+                        cache.put(cacheKey, record);
+                        return record;
+                    });
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -421,24 +425,24 @@ public class PravegaTablesStoreHelper {
      */
     public CompletableFuture<Map.Entry<ByteBuf, List<String>>> getKeysPaginated(String tableName, ByteBuf continuationToken, int limit) {
         log.trace("get keys paginated called for : {}", tableName);
-
         return withRetries(() ->
-                segmentHelper.readTableKeys(tableName, limit, IteratorStateImpl.fromBytes(continuationToken), authToken.get(), RequestTag.NON_EXISTENT_ID),
-                        () -> String.format("get keys paginated for table: %s", tableName))
-                             .thenApplyAsync(result -> {
-                                 try {
-                                     List<String> items = result.getItems().stream().map(x -> new String(getArray(x.getKey()), Charsets.UTF_8))
-                                                                .collect(Collectors.toList());
-                                     log.trace("get keys paginated on table {} returned items {}", tableName, items);
-                                     // if the returned token and result are empty, return the incoming token so that 
-                                     // callers can resume from that token. 
-                                     return new AbstractMap.SimpleEntry<>(getNextToken(continuationToken, result), items);
-                                 } finally {
-                                     releaseKeys(result.getItems());
-                                 }
-                             }, executor);
+                        segmentHelper.readTableKeys(tableName, limit, IteratorStateImpl.fromBytes(continuationToken), authToken.get(),
+                                RequestTag.NON_EXISTENT_ID),
+                () -> String.format("get keys paginated for table: %s", tableName))
+                .thenApplyAsync(result -> {
+                    try {
+                        List<String> items = result.getItems().stream().map(x -> new String(getArray(x.getKey()), Charsets.UTF_8))
+                                .collect(Collectors.toList());
+                        log.trace("get keys paginated on table {} returned items {}", tableName, items);
+                        // if the returned token and result are empty, return the incoming token so that
+                        // callers can resume from that token.
+                        return new AbstractMap.SimpleEntry<>(getNextToken(continuationToken, result), items);
+                    } finally {
+                        releaseKeys(result.getItems());
+                    }
+                }, executor);
     }
-    
+
     /**
      * Method to get paginated list of entries with a continuation token.
      * @param tableName tableName

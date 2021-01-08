@@ -10,10 +10,10 @@
 package io.pravega.local;
 
 import com.google.common.base.Preconditions;
-import io.pravega.client.stream.impl.Credentials;
-import io.pravega.client.stream.impl.DefaultCredentials;
-import io.pravega.common.security.ZKTLSUtils;
 import com.google.common.base.Strings;
+import io.pravega.shared.security.auth.DefaultCredentials;
+import io.pravega.common.function.Callbacks;
+import io.pravega.common.security.ZKTLSUtils;
 import io.pravega.controller.server.ControllerServiceConfig;
 import io.pravega.controller.server.ControllerServiceMain;
 import io.pravega.controller.server.eventProcessor.ControllerEventProcessorConfig;
@@ -36,8 +36,10 @@ import io.pravega.segmentstore.server.host.stat.AutoScalerConfig;
 import io.pravega.segmentstore.server.logs.DurableLogConfig;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.segmentstore.server.store.ServiceConfig;
+import io.pravega.segmentstore.storage.StorageLayoutType;
 import io.pravega.segmentstore.storage.impl.bookkeeper.ZooKeeperServiceRunner;
 import io.pravega.shared.metrics.MetricsConfig;
+import io.pravega.shared.security.auth.Credentials;
 import java.io.IOException;
 import java.net.URI;
 import java.util.Arrays;
@@ -47,6 +49,7 @@ import javax.annotation.concurrent.GuardedBy;
 import lombok.Builder;
 import lombok.Cleanup;
 import lombok.Synchronized;
+import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
@@ -55,8 +58,10 @@ import org.apache.curator.retry.ExponentialBackoffRetry;
 
 @Slf4j
 @Builder
+@ToString
 public class InProcPravegaCluster implements AutoCloseable {
 
+    private static final String LOCALHOST = "localhost";
     private static final int THREADPOOL_SIZE = 20;
     private boolean isInMemStorage;
 
@@ -146,9 +151,7 @@ public class InProcPravegaCluster implements AutoCloseable {
                             && !Strings.isNullOrEmpty(this.keyPasswordFile)),
                     "TLS enabled, but not all parameters set");
 
-            if (this.isInMemStorage) {
-                this.isInProcHDFS = false;
-            }
+            this.isInProcHDFS = this.isInMemStorage ? false : true;
             return new InProcPravegaCluster(isInMemStorage, enableMetrics, enableAuth, enableTls, enableTlsReload,
                     isInProcController, controllerCount, controllerPorts, controllerURI,
                     restServerPort, isInProcSegmentStore, segmentStoreCount, segmentStorePorts, isInProcZK, zkPort, zkHost,
@@ -238,7 +241,9 @@ public class InProcPravegaCluster implements AutoCloseable {
     }
 
     private void startLocalHDFS() throws IOException {
-        localHdfs = LocalHDFSEmulator.newBuilder().baseDirName("temp").build();
+        String baseDir = "temp";
+        log.info("Starting HDFS Emulator @ {}/{}", System.getProperty("java.io.tmpdir"), baseDir);
+        localHdfs = LocalHDFSEmulator.newBuilder().baseDirName(baseDir).build();
         localHdfs.start();
     }
 
@@ -275,11 +280,14 @@ public class InProcPravegaCluster implements AutoCloseable {
                         .with(ServiceConfig.KEY_FILE, this.keyFile)
                         .with(ServiceConfig.CERT_FILE, this.certFile)
                         .with(ServiceConfig.ENABLE_TLS_RELOAD, this.enableTlsReload)
+                        .with(ServiceConfig.LISTENING_IP_ADDRESS, this.enableTls ? LOCALHOST : "")
+                        .with(ServiceConfig.PUBLISHED_IP_ADDRESS, this.enableTls ? LOCALHOST : "")
                         .with(ServiceConfig.CACHE_POLICY_MAX_TIME, 60)
                         .with(ServiceConfig.CACHE_POLICY_MAX_SIZE, 128 * 1024 * 1024L)
                         .with(ServiceConfig.DATALOG_IMPLEMENTATION, isInMemStorage ?
                                 ServiceConfig.DataLogType.INMEMORY :
                                 ServiceConfig.DataLogType.BOOKKEEPER)
+                        .with(ServiceConfig.STORAGE_LAYOUT, StorageLayoutType.ROLLING_STORAGE)
                         .with(ServiceConfig.STORAGE_IMPLEMENTATION, isInMemStorage ?
                                 ServiceConfig.StorageType.INMEMORY :
                                 ServiceConfig.StorageType.FILESYSTEM))
@@ -403,8 +411,13 @@ public class InProcPravegaCluster implements AutoCloseable {
                 .build();
 
         ControllerServiceMain controllerService = new ControllerServiceMain(serviceConfig);
-        controllerService.startAsync();
-        return controllerService;
+        try {
+            controllerService.startAsync().awaitRunning();
+            return controllerService;
+        } catch (Throwable ex) {
+            Callbacks.invokeSafely(controllerService::close, ex2 -> log.error("Unable to clean up controller startup.", ex2));
+            throw ex;
+        }
     }
 
     @Synchronized
@@ -412,28 +425,37 @@ public class InProcPravegaCluster implements AutoCloseable {
         return controllerURI;
     }
 
-    @Synchronized
-    public String getZkUrl() {
-        return zkUrl;
-    }
-
     @Override
     @Synchronized
     public void close() throws Exception {
         if (isInProcSegmentStore) {
-            for ( ServiceStarter starter : this.nodeServiceStarter ) {
+            for (ServiceStarter starter : this.nodeServiceStarter) {
                 starter.shutdown();
             }
         }
         if (isInProcController) {
-            for ( ControllerServiceMain controller : this.controllerServers ) {
-                    controller.stopAsync();
-                }
+            for (ControllerServiceMain controller : this.controllerServers) {
+                Callbacks.invokeSafely(controller::close, ex -> log.error("Unable to shut down Controller.", ex));
+            }
         }
 
         if (this.zkService != null) {
             this.zkService.close();
             this.zkService = null;
         }
+    }
+
+    // Assumes toString is autogenerated by Lombok.
+    public String print() {
+        String auto = this.toString();
+        int start = auto.indexOf("(") + 1;
+        int end = auto.indexOf(")");
+        String[] opts = auto.substring(start, end).split(",");
+        StringBuilder result = new StringBuilder(String.format("%s%n", auto.substring(0, start)));
+        for (String opt : opts) {
+            result.append(String.format("\t%s%n", opt.trim()));
+        }
+        result.append(auto.substring(end, auto.length()));
+        return result.toString();
     }
 }

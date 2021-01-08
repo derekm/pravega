@@ -35,6 +35,21 @@ public final class NameUtils {
     public static final String READER_GROUP_STREAM_PREFIX = INTERNAL_NAME_PREFIX + "RG";
 
     /**
+     * Size of the prefix or suffix included with the user stream name.
+     */
+    public static final int MAX_PREFIX_OR_SUFFIX_SIZE = 5;
+
+    /**
+     * Size of the overall name as permitted by the host.
+     */
+    public static final int MAX_NAME_SIZE = 255;
+
+    /**
+     * Size of the name that can be specified by user.
+     */
+    public static final int MAX_GIVEN_NAME_SIZE = MAX_NAME_SIZE - MAX_PREFIX_OR_SUFFIX_SIZE;
+
+    /**
      * This is used for composing metric tags.
      */
     static final String TAG_SCOPE = "scope";
@@ -70,9 +85,24 @@ public final class NameUtils {
     private static final String EPOCH_DELIMITER = ".#epoch.";
 
     /**
+     * Format for chunk name with segment name , epoch and offset.
+     */
+    private static final String CHUNK_NAME_FORMAT_WITH_EPOCH_OFFSET = "%s.E-%d-O-%d.%s";
+
+    /**
      * Format for Container Metadata Segment name.
      */
     private static final String METADATA_SEGMENT_NAME_FORMAT = "_system/containers/metadata_%d";
+
+    /**
+     * Format for Storage Metadata Segment name.
+     */
+    private static final String STORAGE_METADATA_SEGMENT_NAME_FORMAT = "_system/containers/storage_metadata_%d";
+
+    /**
+     * Format for Container System Journal file name.
+     */
+    private static final String SYSJOURNAL_NAME_FORMAT = "_system/containers/_sysjournal.epoch%d.container%d.file%d";
 
     /**
      * The Transaction unique identifier is made of two parts, each having a length of 16 bytes (64 bits in Hex).
@@ -102,7 +132,7 @@ public final class NameUtils {
     /**
      * Prefix for identifying system created mark segments for storing watermarks. 
      */
-    @Getter(AccessLevel.PACKAGE)
+    @Getter(AccessLevel.PUBLIC)
     private static final String MARK_PREFIX = INTERNAL_NAME_PREFIX + "MARK";
 
     //endregion
@@ -175,13 +205,23 @@ public final class NameUtils {
     }
 
     /**
+     * Checks whether the given name is an Attribute Segment or not.
+     *
+     * @param segmentName   The name of the segment.
+     * @return              True if the segment is an attribute Segment, false otherwise.
+     */
+    public static boolean isAttributeSegment(String segmentName) {
+        return segmentName.endsWith(ATTRIBUTE_SUFFIX);
+    }
+
+    /**
      * Gets the name of the meta-Segment mapped to the given Segment Name that is responsible with storing extended attributes.
      *
      * @param segmentName The name of the Segment to get the Attribute segment name for.
      * @return The result.
      */
     public static String getAttributeSegmentName(String segmentName) {
-        Preconditions.checkArgument(!segmentName.endsWith(ATTRIBUTE_SUFFIX), "segmentName is already an attribute segment name");
+        Preconditions.checkArgument(!isAttributeSegment(segmentName), "segmentName is already an attribute segment name");
         return segmentName + ATTRIBUTE_SUFFIX;
     }
 
@@ -232,6 +272,18 @@ public final class NameUtils {
     }
 
     /**
+     * Gets the name of the SegmentChunk for the given segment, epoch and offset.
+     *
+     * @param segmentName The name of the Segment to get the SegmentChunk name for.
+     * @param epoch       The epoch of the container.
+     * @param offset      The starting offset of the SegmentChunk.
+     * @return formatted chunk name.
+     */
+    public static String getSegmentChunkName(String segmentName, long epoch, long offset) {
+        return String.format(CHUNK_NAME_FORMAT_WITH_EPOCH_OFFSET, segmentName, epoch, offset, UUID.randomUUID());
+    }
+
+    /**
      * Gets the name of the Segment that is used to store the Container's Segment Metadata. There is one such Segment
      * per container.
      *
@@ -241,6 +293,29 @@ public final class NameUtils {
     public static String getMetadataSegmentName(int containerId) {
         Preconditions.checkArgument(containerId >= 0, "containerId must be a non-negative number.");
         return String.format(METADATA_SEGMENT_NAME_FORMAT, containerId);
+    }
+
+    /**
+     * Gets the name of the Segment that is used to store the Container's Segment Metadata. There is one such Segment
+     * per container.
+     *
+     * @param containerId The Id of the Container.
+     * @return The Metadata Segment name.
+     */
+    public static String getStorageMetadataSegmentName(int containerId) {
+        Preconditions.checkArgument(containerId >= 0, "containerId must be a non-negative number.");
+        return String.format(STORAGE_METADATA_SEGMENT_NAME_FORMAT, containerId);
+    }
+
+    /**
+     * Gets file name of SystemJournal for given container instance.
+     * @param containerId The Id of the Container.
+     * @param epoch Epoch of the container instance.
+     * @param currentFileIndex Current index for journal file.
+     * @return File name of SystemJournal for given container instance
+     */
+    public static String getSystemJournalFileName(int containerId, long epoch, long currentFileIndex) {
+        return String.format(SYSJOURNAL_NAME_FORMAT, epoch, containerId, currentFileIndex);
     }
 
     /**
@@ -309,6 +384,17 @@ public final class NameUtils {
      */
     public static String getScopedKeyValueTableName(String scope, String streamName) {
         return getScopedStreamNameInternal(scope, streamName).toString();
+    }
+
+    /**
+     * Compose and return scoped ReaderGroup name.
+     *
+     * @param scope scope to be used in ScopedReaderGroup name.
+     * @param rgName ReaderGroup name to be used in ScopedReaderGroup name.
+     * @return scoped stream name.
+     */
+    public static String getScopedReaderGroupName(String scope, String rgName) {
+        return getScopedStreamNameInternal(scope, rgName).toString();
     }
 
     /**
@@ -573,6 +659,7 @@ public final class NameUtils {
      */
     public static String validateUserStreamName(String name) {
         Preconditions.checkNotNull(name);
+        Preconditions.checkArgument(name.length() <= MAX_GIVEN_NAME_SIZE, "Name cannot exceed %s characters", MAX_GIVEN_NAME_SIZE);
         Preconditions.checkArgument(name.matches("[\\p{Alnum}\\.\\-]+"), "Name must be a-z, 0-9, ., -.");
         return name;
     }
@@ -597,6 +684,7 @@ public final class NameUtils {
 
         // In addition to user stream names, pravega internally created stream have a special prefix.
         final String matcher = "[" + INTERNAL_NAME_PREFIX + "]?[\\p{Alnum}\\.\\-]+";
+        Preconditions.checkArgument(name.length() <= MAX_NAME_SIZE, "Name cannot exceed %s characters", MAX_NAME_SIZE);
         Preconditions.checkArgument(name.matches(matcher), "Name must be " + matcher);
         return name;
     }
@@ -608,7 +696,10 @@ public final class NameUtils {
      * @return The name in the case is valid.
      */
     public static String validateUserScopeName(String name) {
-        return validateUserStreamName(name);
+        Preconditions.checkNotNull(name);
+        Preconditions.checkArgument(name.length() <= MAX_NAME_SIZE, "Name cannot exceed %s characters", MAX_NAME_SIZE);
+        Preconditions.checkArgument(name.matches("[\\p{Alnum}\\.\\-]+"), "Name must be a-z, 0-9, ., -.");
+        return name;
     }
 
     /**

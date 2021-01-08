@@ -40,7 +40,8 @@ import io.pravega.controller.server.SegmentHelper;
 import io.pravega.controller.server.eventProcessor.ControllerEventProcessorConfig;
 import io.pravega.controller.server.eventProcessor.requesthandlers.AbortRequestHandler;
 import io.pravega.controller.server.eventProcessor.requesthandlers.CommitRequestHandler;
-import io.pravega.controller.server.rpc.auth.GrpcAuthHelper;
+import io.pravega.controller.server.security.auth.GrpcAuthHelper;
+import io.pravega.controller.store.Version;
 import io.pravega.controller.store.checkpoint.CheckpointStoreException;
 import io.pravega.controller.store.checkpoint.CheckpointStoreFactory;
 import io.pravega.controller.store.host.HostControllerStore;
@@ -53,7 +54,6 @@ import io.pravega.controller.store.stream.StoreException;
 import io.pravega.controller.store.stream.StreamMetadataStore;
 import io.pravega.controller.store.stream.StreamStoreFactory;
 import io.pravega.controller.store.stream.TxnStatus;
-import io.pravega.controller.store.Version;
 import io.pravega.controller.store.stream.VersionedTransactionData;
 import io.pravega.controller.store.stream.records.StreamSegmentRecord;
 import io.pravega.controller.store.task.TaskMetadataStore;
@@ -77,7 +77,6 @@ import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -85,8 +84,9 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 import lombok.Cleanup;
 import lombok.SneakyThrows;
-import lombok.val;
 import lombok.extern.slf4j.Slf4j;
+import lombok.val;
+import org.apache.commons.lang3.NotImplementedException;
 import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.curator.framework.CuratorFramework;
@@ -124,7 +124,7 @@ public class StreamTransactionMetadataTasksTest {
     private static final String STREAM = "stream1";
 
     boolean authEnabled = false;
-    private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(10);
+    private final ScheduledExecutorService executor = ExecutorServiceHelpers.newScheduledThreadPool(10, "test");
 
     private ControllerService consumer;
 
@@ -605,7 +605,7 @@ public class StreamTransactionMetadataTasksTest {
         assertEquals(PingTxnStatus.Status.COMMITTED, txnTasks.pingTxn(SCOPE, STREAM, txnId, 10000L, null).join().getStatus());
 
         // complete commit of transaction. 
-        streamStoreMock.startCommitTransactions(SCOPE, STREAM, null, executor).join();
+        streamStoreMock.startCommitTransactions(SCOPE, STREAM, 100, null, executor).join();
         val record = streamStoreMock.getVersionedCommittingTransactionsRecord(SCOPE, STREAM, null, executor).join();
         streamStoreMock.completeCommitTransactions(SCOPE, STREAM, record, null, executor).join();
 
@@ -755,6 +755,11 @@ public class StreamTransactionMetadataTasksTest {
         public CompletableFuture<Void> writeEvent(String routingKey, T event) {
             requestsReceived.offer(new ImmutablePair<>(routingKey, event));
             return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public CompletableFuture<Void> writeEvents(String routingKey, List<T> events) {
+            throw new NotImplementedException("mock doesnt require this");
         }
 
         @Override

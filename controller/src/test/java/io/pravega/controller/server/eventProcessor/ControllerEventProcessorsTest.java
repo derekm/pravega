@@ -14,7 +14,9 @@ import com.google.common.util.concurrent.Service;
 import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.connection.impl.ConnectionPool;
 import io.pravega.client.control.impl.Controller;
+import io.pravega.client.segment.impl.Segment;
 import io.pravega.client.stream.EventStreamWriter;
+import io.pravega.client.stream.impl.PositionImpl;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.controller.eventProcessor.EventProcessorGroup;
 import io.pravega.controller.eventProcessor.EventProcessorSystem;
@@ -31,42 +33,37 @@ import io.pravega.controller.task.Stream.StreamTransactionMetadataTasks;
 import io.pravega.shared.controller.event.AbortEvent;
 import io.pravega.shared.controller.event.CommitEvent;
 import io.pravega.shared.controller.event.ControllerEvent;
+
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import org.junit.After;
-import org.junit.Before;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import io.pravega.test.common.ThreadPooledTestSuite;
+import lombok.Cleanup;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
+import static org.mockito.Mockito.doReturn;
 
-public class ControllerEventProcessorsTest {
-    ScheduledExecutorService executor;
-
-    @Before
-    public void setUp() {
-        executor = Executors.newSingleThreadScheduledExecutor();
-    }
-
-    @After
-    public void tearDown() {
-        executor.shutdown();
+public class ControllerEventProcessorsTest extends ThreadPooledTestSuite {
+    @Override
+    public int getThreadPoolSize() {
+        return 10;
     }
     
     @Test(timeout = 10000)
@@ -94,77 +91,7 @@ public class ControllerEventProcessorsTest {
         TableMetadataTasks kvtTasks = mock(TableMetadataTasks.class);
         ControllerEventProcessorConfig config = ControllerEventProcessorConfigImpl.withDefault();
         EventProcessorSystem system = mock(EventProcessorSystem.class);
-        EventProcessorGroup<ControllerEvent> processor = new EventProcessorGroup<ControllerEvent>() {
-            @Override
-            public void notifyProcessFailure(String process) throws CheckpointStoreException {
-
-            }
-
-            @Override
-            public EventStreamWriter<ControllerEvent> getWriter() {
-                return null;
-            }
-
-            @Override
-            public Set<String> getProcesses() throws CheckpointStoreException {
-                return Sets.newHashSet("host1", "host2");
-            }
-
-            @Override
-            public Service startAsync() {
-                return null;
-            }
-
-            @Override
-            public boolean isRunning() {
-                return false;
-            }
-
-            @Override
-            public State state() {
-                return null;
-            }
-
-            @Override
-            public Service stopAsync() {
-                return null;
-            }
-
-            @Override
-            public void awaitRunning() {
-
-            }
-
-            @Override
-            public void awaitRunning(long timeout, TimeUnit unit) throws TimeoutException {
-
-            }
-
-            @Override
-            public void awaitTerminated() {
-
-            }
-
-            @Override
-            public void awaitTerminated(long timeout, TimeUnit unit) throws TimeoutException {
-
-            }
-
-            @Override
-            public Throwable failureCause() {
-                return null;
-            }
-
-            @Override
-            public void addListener(Listener listener, Executor executor) {
-
-            }
-
-            @Override
-            public void close() throws Exception {
-
-            }
-        };
+        EventProcessorGroup<ControllerEvent> processor = getProcessor();
 
         try {
             when(system.createEventProcessorGroup(any(), any(), any())).thenReturn(processor);
@@ -172,10 +99,11 @@ public class ControllerEventProcessorsTest {
             e.printStackTrace();
         }
 
+        @Cleanup
         ControllerEventProcessors processors = new ControllerEventProcessors("host1",
                 config, localController, checkpointStore, streamStore, bucketStore, 
                 connectionPool, streamMetadataTasks, streamTransactionMetadataTasks, 
-                kvtStore, kvtTasks, system, executor);
+                kvtStore, kvtTasks, system, executorService());
         processors.startAsync();
         processors.awaitRunning();
         assertTrue(Futures.await(processors.sweepFailedProcesses(() -> Sets.newHashSet("host1"))));
@@ -239,10 +167,11 @@ public class ControllerEventProcessorsTest {
             return createStreamResponses.take();
         }).when(controller).createStream(anyString(), anyString(), any());
 
+        @Cleanup
         ControllerEventProcessors processors = new ControllerEventProcessors("host1",
                 config, controller, checkpointStore, streamStore, bucketStore,
                 connectionPool, streamMetadataTasks, streamTransactionMetadataTasks,
-                kvtStore, kvtTasks, system, executor);
+                kvtStore, kvtTasks, system, executorService());
 
         // call bootstrap on ControllerEventProcessors
         processors.bootstrap(streamTransactionMetadataTasks, streamMetadataTasks, kvtTasks);
@@ -296,4 +225,200 @@ public class ControllerEventProcessorsTest {
         createStreamResponsesList.get(7).complete(true);
     }
     
+    @Test(timeout = 10000L)
+    public void testTruncate() throws CheckpointStoreException, InterruptedException {
+        Controller controller = mock(Controller.class);
+        CheckpointStore checkpointStore = mock(CheckpointStore.class);
+        StreamMetadataStore streamStore = mock(StreamMetadataStore.class);
+        BucketStore bucketStore = mock(BucketStore.class);
+        ConnectionPool connectionPool = mock(ConnectionPool.class);
+        StreamMetadataTasks streamMetadataTasks = mock(StreamMetadataTasks.class);
+        StreamTransactionMetadataTasks streamTransactionMetadataTasks = mock(StreamTransactionMetadataTasks.class);
+        KVTableMetadataStore kvtStore = mock(KVTableMetadataStore.class);
+        TableMetadataTasks kvtTasks = mock(TableMetadataTasks.class);
+        ControllerEventProcessorConfig config = ControllerEventProcessorConfigImpl.withDefault();
+        EventProcessorSystem system = mock(EventProcessorSystem.class);
+
+        Map<Segment, Long> map1 = new HashMap<>();
+        map1.put(new Segment("scope", "stream", 0L), 10L);
+        map1.put(new Segment("scope", "stream", 1L), 10L);
+        map1.put(new Segment("scope", "stream", 2L), 20L);
+        Map<Segment, Long> map2 = new HashMap<>();
+        map2.put(new Segment("scope", "stream", 0L), 20L);
+        map2.put(new Segment("scope", "stream", 2L), 10L);
+        Map<Segment, Long> map3 = new HashMap<>();
+        map3.put(new Segment("scope", "stream", 3L), 0L);
+        map3.put(new Segment("scope", "stream", 4L), 10L);
+        map3.put(new Segment("scope", "stream", 5L), 20L);
+
+        PositionImpl position1 = mock(PositionImpl.class);
+        when(position1.getOwnedSegmentsWithOffsets()).thenReturn(map1);
+        when(position1.asImpl()).thenReturn(position1);
+        PositionImpl position2 = mock(PositionImpl.class);
+        when(position2.getOwnedSegmentsWithOffsets()).thenReturn(map2);
+        when(position2.asImpl()).thenReturn(position2);
+        PositionImpl position3 = mock(PositionImpl.class);
+        when(position3.getOwnedSegmentsWithOffsets()).thenReturn(map3);
+        when(position3.asImpl()).thenReturn(position3);
+        
+        doReturn(getProcessor()).when(system).createEventProcessorGroup(any(), any(), any());
+
+        doReturn(CompletableFuture.completedFuture(null)).when(controller).createScope(anyString());
+        doReturn(CompletableFuture.completedFuture(null)).when(controller).createStream(anyString(), anyString(), any());
+
+        doNothing().when(streamMetadataTasks).initializeStreamWriters(any(), anyString());
+        doNothing().when(streamTransactionMetadataTasks).initializeStreamWriters(any(EventStreamClientFactory.class),
+                any(ControllerEventProcessorConfig.class));
+        
+        // first throw checkpoint store exception
+        CompletableFuture<Void> signal = new CompletableFuture<>();
+        when(checkpointStore.getProcesses()).thenAnswer(x -> {
+            signal.complete(null);
+            throw new CheckpointStoreException("checkpointstoreexception");
+        });
+
+        @Cleanup
+        ControllerEventProcessors processors = new ControllerEventProcessors("host1",
+                config, controller, checkpointStore, streamStore, bucketStore,
+                connectionPool, streamMetadataTasks, streamTransactionMetadataTasks,
+                kvtStore, kvtTasks, system, executorService());
+
+        // set truncation interval
+        processors.setTruncationInterval(100L);
+        processors.startAsync();
+        processors.awaitRunning();
+        ControllerEventProcessors processorsSpied = spy(processors);
+        processorsSpied.bootstrap(streamTransactionMetadataTasks, streamMetadataTasks, kvtTasks);
+
+        signal.join();
+        verify(processorsSpied, atLeastOnce()).truncate(any(), any(), any());
+        verify(checkpointStore, atLeastOnce()).getProcesses();
+        verify(checkpointStore, never()).getPositions(anyString(), anyString());
+        verify(streamMetadataTasks, never()).startTruncation(anyString(), anyString(), any(), any(), anyLong());
+
+        reset(checkpointStore);
+        // now set the checkpoint store to return correct values
+        Set<String> processes = Sets.newHashSet("p1", "p2", "p3");
+        when(checkpointStore.getProcesses()).thenReturn(processes);
+        when(checkpointStore.getPositions(any(), anyString())).thenAnswer(i -> {
+            String key = i.getArgument(0);
+            switch (key) {
+                case "p1":
+                    return Collections.singletonMap("r1", position1);
+                case "p2":
+                    return Collections.singletonMap("r2", position2);
+                case "p3":
+                    return Collections.singletonMap("r3", position3);
+                default:
+                    return Collections.emptyMap();
+            }
+        });
+
+        CountDownLatch latch = new CountDownLatch(4);
+        AtomicInteger counter = new AtomicInteger();
+        when(streamMetadataTasks.startTruncation(anyString(), anyString(), any(), any(), anyLong())).thenAnswer(x -> {
+            latch.countDown();
+            counter.getAndIncrement();
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            if (counter.get() == 1) {
+                // let one of the processors throw the exception. this should still be retried in the next cycle.
+                throw new RuntimeException();
+            } else if (counter.get() == 2) {
+                // let one of the processors throw the exception. this should still be retried in the next cycle.
+                return CompletableFuture.completedFuture(false);
+            }
+            return CompletableFuture.completedFuture(true);
+        });
+        latch.await();
+
+        // verify that truncate method is being called periodically. 
+        verify(processorsSpied, atLeastOnce()).truncate(config.getRequestStreamName(), config.getRequestReaderGroupName(), streamMetadataTasks);
+        verify(processorsSpied, atLeastOnce()).truncate(config.getCommitStreamName(), config.getCommitReaderGroupName(), streamMetadataTasks);
+        verify(processorsSpied, atLeastOnce()).truncate(config.getAbortStreamName(), config.getAbortReaderGroupName(), streamMetadataTasks);
+        verify(processorsSpied, atLeastOnce()).truncate(config.getKvtStreamName(), config.getKvtReaderGroupName(), streamMetadataTasks);
+
+        verify(checkpointStore, atLeastOnce()).getPositions("p1", config.getRequestReaderGroupName());
+        verify(checkpointStore, atLeastOnce()).getPositions("p1", config.getCommitReaderGroupName());
+        verify(checkpointStore, atLeastOnce()).getPositions("p1", config.getAbortReaderGroupName());
+        verify(checkpointStore, atLeastOnce()).getPositions("p1", config.getKvtReaderGroupName());
+    }
+
+    private EventProcessorGroup<ControllerEvent> getProcessor() {
+        return new EventProcessorGroup<ControllerEvent>() {
+            @Override
+            public void notifyProcessFailure(String process) throws CheckpointStoreException {
+
+            }
+
+            @Override
+            public EventStreamWriter<ControllerEvent> getWriter() {
+                return null;
+            }
+
+            @Override
+            public Set<String> getProcesses() throws CheckpointStoreException {
+                return Sets.newHashSet("host1", "host2");
+            }
+            
+            @Override
+            public Service startAsync() {
+                return null;
+            }
+
+            @Override
+            public boolean isRunning() {
+                return false;
+            }
+
+            @Override
+            public State state() {
+                return null;
+            }
+
+            @Override
+            public Service stopAsync() {
+                return null;
+            }
+
+            @Override
+            public void awaitRunning() {
+
+            }
+
+            @Override
+            public void awaitRunning(long timeout, TimeUnit unit) throws TimeoutException {
+
+            }
+
+            @Override
+            public void awaitTerminated() {
+
+            }
+
+            @Override
+            public void awaitTerminated(long timeout, TimeUnit unit) throws TimeoutException {
+
+            }
+
+            @Override
+            public Throwable failureCause() {
+                return null;
+            }
+
+            @Override
+            public void addListener(Listener listener, Executor executor) {
+
+            }
+
+            @Override
+            public void close() throws Exception {
+
+            }
+        };
+    }
+
 }

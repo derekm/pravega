@@ -38,10 +38,9 @@ import io.pravega.client.stream.impl.ClientFactoryImpl;
 import io.pravega.client.stream.impl.JavaSerializer;
 import io.pravega.client.stream.impl.StreamCutImpl;
 import io.pravega.client.watermark.WatermarkSerializer;
-import io.pravega.common.Exceptions;
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.hash.RandomFactory;
-import io.pravega.controller.store.stream.StoreException;
 import io.pravega.shared.NameUtils;
 import io.pravega.shared.watermarks.Watermark;
 import io.pravega.test.common.AssertExtensions;
@@ -57,7 +56,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -93,7 +91,7 @@ public class WatermarkingTest extends AbstractSystemTest {
     private Service controllerInstance;
     private URI controllerURI;
     private StreamManager streamManager;
-    private final ScheduledExecutorService executorService = Executors.newScheduledThreadPool(5);
+    private final ScheduledExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(5, "test");
 
     /**
      * This is used to setup the various services required by the system test framework.
@@ -123,6 +121,7 @@ public class WatermarkingTest extends AbstractSystemTest {
     @After
     public void tearDown() {
         streamManager.close();
+        ExecutorServiceHelpers.shutdown(executorService);
     }
 
     @Test
@@ -152,13 +151,6 @@ public class WatermarkingTest extends AbstractSystemTest {
         // scale the stream several times so that we get complex positions
         Stream streamObj = Stream.of(SCOPE, STREAM);
         scale(controller, streamObj);
-
-        // wait until mark stream is created
-        AtomicBoolean markStreamCreated = new AtomicBoolean(false);
-        Futures.loop(() -> !markStreamCreated.get(), 
-                () -> Futures.exceptionallyExpecting(controller.getCurrentSegments(SCOPE, NameUtils.getMarkStreamForStream(STREAM)), 
-                    e -> Exceptions.unwrap(e) instanceof StoreException.DataNotFoundException, null)
-                .thenAccept(v -> markStreamCreated.set(v != null)), executorService);
 
         @Cleanup
         ClientFactoryImpl syncClientFactory = new ClientFactoryImpl(SCOPE,

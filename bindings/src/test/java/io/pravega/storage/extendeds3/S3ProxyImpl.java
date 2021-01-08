@@ -37,7 +37,7 @@ import lombok.Synchronized;
 import lombok.val;
 import org.apache.commons.httpclient.HttpStatus;
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.lang.ArrayUtils;
+import org.apache.commons.lang3.ArrayUtils;
 import org.gaul.s3proxy.AuthenticationType;
 import org.gaul.s3proxy.S3Proxy;
 import org.jclouds.ContextBuilder;
@@ -60,7 +60,7 @@ public class S3ProxyImpl extends S3ImplBase {
         properties.setProperty("s3proxy.authorization", "none");
         properties.setProperty("s3proxy.endpoint", endpoint);
         properties.setProperty("jclouds.provider", "filesystem");
-        properties.setProperty("jclouds.filesystem.basedir", "/tmp/s3proxy");
+        properties.setProperty("jclouds.filesystem.basedir", System.getProperty("java.io.tmpdir", "/tmp") + "/s3proxy");
 
         ContextBuilder builder = ContextBuilder
                 .newBuilder("filesystem")
