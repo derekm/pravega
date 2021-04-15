@@ -24,25 +24,15 @@ The following will be the primary feature focus areas for our upcoming releases.
 * Security
     * TLS 1.3
 * Serviceability
-    * DR tool
-    * Logging
-    * Migration
+    * Disaster Recovery
     * Health Check ([PDP 45](https://github.com/pravega/pravega/wiki/PDP-45-Pravega-Healthcheck), [#5046](https://github.com/pravega/pravega/issues/5046), [#5098](https://github.com/pravega/pravega/issues/5098))
-    * Better handling of LTS
-        * Load external LTS drivers
-        * Full AWS S3 support for LTS including IAM
-        * Separate LTS configurations per scope
-    * Improve metrics, esp. LTS
-    * Repair tools
+    * Improved metrics & logging
 * Performance
     * Transactions
     * Read performance (tail, historical & random)
 * Operators
-    * Horizontal scaling of Pravega Cluster
-    * Connecting stream and resource auto-scaling
-    * End-to-end scaling from ingestion to processing
-* KV Store beta 2.0
-* Python native client production ready
+    * Dynamic scaling
+* Key-Value Store beta 2.0
 * Consumption Based Rentention production ready ([#5108](https://github.com/pravega/pravega/issues/5108))
 
 ## Version 0.11
